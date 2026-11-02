@@ -19,6 +19,8 @@ use Engelsystem\Http\Response;
 use Engelsystem\Http\UrlGenerator;
 use Engelsystem\Models\OAuth;
 use Engelsystem\Models\User\User;
+use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
 
 /**
  * Bot setup, the volunteer import, the QR codes and the dashboard for coordinators
@@ -36,13 +38,17 @@ class AdminController extends BaseController
         protected Redirector $redirect,
         protected Bot $bot,
         protected Authenticator $auth,
-        protected UrlGenerator $url
+        protected UrlGenerator $url,
+        protected Swap $swap,
+        protected LoggerInterface $log
     ) {
     }
 
     public function index(): Response
     {
-        $me = $this->bot->isConfigured() ? $this->bot->api()->call('getMe') : null;
+        // A page view doesn't wait long for Telegram
+        $this->bot->api()->retryBriefly();
+        $me = $this->bot->me();
         $webhook = $me ? $this->bot->api()->call('getWebhookInfo') : null;
 
         return $this->response->withView('telegram/admin', [
@@ -169,7 +175,7 @@ class AdminController extends BaseController
     }
 
     /**
-     * Onboarding progress, today's shifts, open slots and the bot's activity
+     * Open slots today and tomorrow, and onboarding progress
      */
     public function dashboard(): Response
     {
@@ -181,9 +187,70 @@ class AdminController extends BaseController
      */
     public function dashboardScript(): Response
     {
+        return $this->script('dashboard.js');
+    }
+
+    /**
+     * Swapping people between two shifts of the same half day, see Swap
+     */
+    public function swap(Request $request): Response
+    {
+        return $this->response->withView('telegram/swap', Swap::data(
+            $request->get('day'),
+            $request->get('half'),
+            $request->get('left'),
+            $request->get('right')
+        ));
+    }
+
+    public function swapScript(): Response
+    {
+        return $this->script('swap.js');
+    }
+
+    public function swapMove(Request $request): Response
+    {
+        $left = (string) $request->postData('left');
+        $right = (string) $request->postData('right');
+        try {
+            $by = $this->auth->user();
+            $result = $this->swap->run(
+                $left,
+                $right,
+                $request->request->all('from_left'),
+                $request->request->all('from_right'),
+                $by
+            );
+            AfterResponse::run($this->log, 'Swap messages', fn() => $this->swap->tell($result, $by));
+
+            $this->addNotification(sprintf(
+                'Moved %s. The bot tells them, the leads of both shifts and coordination.',
+                Swap::summary($result)
+            ));
+            if ($unreachable = Swap::unreachable($result)) {
+                $this->addNotification(
+                    'Not on Telegram, please tell them directly: '
+                    . implode(', ', array_map(fn(User $user) => $user->displayName, $unreachable)),
+                    NotificationType::WARNING
+                );
+            }
+        } catch (InvalidArgumentException $e) {
+            $this->addNotification($e->getMessage(), NotificationType::ERROR);
+        }
+
+        return $this->redirect->to($this->url->to('/admin/telegram/swap', [
+            'day'   => $request->postData('day'),
+            'half'  => $request->postData('half'),
+            'left'  => $left,
+            'right' => $right,
+        ]));
+    }
+
+    protected function script(string $file): Response
+    {
         return $this->response
             ->withHeader('Content-Type', 'text/javascript')
-            ->withContent((string) file_get_contents(__DIR__ . '/../resources/dashboard.js'));
+            ->withContent((string) file_get_contents(__DIR__ . '/../resources/' . $file));
     }
 
     /**
@@ -204,11 +271,7 @@ class AdminController extends BaseController
             // Each update keeps a PHP worker busy for a moment; leave enough for the website
             'max_connections' => 8,
         ]);
-        $this->bot->api()->call('setMyCommands', ['commands' => [
-            ['command' => 'shifts', 'description' => 'Your upcoming shifts'],
-            ['command' => 'team', 'description' => 'Leads: your team, onboarding and check-ins'],
-            ['command' => 'gaps', 'description' => 'Leads: open slots today and tomorrow'],
-        ]]);
+        $this->bot->setCommands();
 
         $this->addNotification(
             $ok ? 'Bot connected to ' . $this->url->to(BotController::WEBHOOK_PATH) : 'Connecting the bot failed, see log.',
@@ -223,7 +286,8 @@ class AdminController extends BaseController
      */
     public function qr(Request $request): Response
     {
-        $me = $this->bot->api()->call('getMe');
+        $this->bot->api()->retryBriefly();
+        $me = $this->bot->me();
         if (!$me) {
             // Never a guessed link: it would send people to the wrong bot
             return $this->response->withStatus(503)->withContent('Telegram is not reachable, try again.');

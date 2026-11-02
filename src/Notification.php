@@ -19,7 +19,6 @@ use Engelsystem\Models\Shifts\ShiftEntry;
  * @property int         $angel_type_id
  * @property Carbon|null $sent_at
  * @property string|null $answer
- * @property int|null    $prompt_message_id
  * @property Carbon      $updated_at
  */
 class Notification extends BaseModel
@@ -29,13 +28,9 @@ class Notification extends BaseModel
     /** shift_id is the news id here */
     public const NEWS = 'news';
 
-    /** Answers to the pre-shift ping; what counts is recorded in Engelsystem (entry removed or no-show) */
-    public const ASKED = 'asked';
-    public const CANT = 'cant';
-    public const EXCUSED = 'excused';
-    public const UNEXCUSED = 'unexcused';
-    /** Picked as a replacement: being checked in for the day doesn't count until the lead saw them there */
+    /** Picked as a replacement shortly before the shift, so no reminder; the roll call says so */
     public const MOVED = 'moved';
+    /** Marked here by the lead in the roll call; the daily check-in at the desk doesn't count */
     public const HERE = 'here';
 
     public $table = 'telegram_notifications'; // phpcs:ignore
@@ -43,14 +38,13 @@ class Notification extends BaseModel
     public $timestamps = true; // phpcs:ignore
 
     protected $casts = [ // phpcs:ignore
-        'shift_id'          => 'integer',
-        'user_id'           => 'integer',
-        'angel_type_id'     => 'integer',
-        'sent_at'           => 'datetime',
-        'prompt_message_id' => 'integer',
+        'shift_id'      => 'integer',
+        'user_id'       => 'integer',
+        'angel_type_id' => 'integer',
+        'sent_at'       => 'datetime',
     ];
 
-    protected $fillable = ['kind', 'shift_id', 'user_id', 'angel_type_id', 'answer', 'prompt_message_id']; // phpcs:ignore
+    protected $fillable = ['kind', 'shift_id', 'user_id', 'angel_type_id', 'answer']; // phpcs:ignore
 
     /**
      * Claims the notification for sending, returns false if it was sent or claimed already
@@ -66,10 +60,12 @@ class Notification extends BaseModel
             return true;
         }
 
+        // Marked here early (/rollcall the evening before) still gets the reminder; a replacement
+        // was told directly (MOVED, and anyone answer() marked as told has sent_at)
         return self::query()
             ->where($key)
             ->whereNull('sent_at')
-            ->whereNull('answer')
+            ->where(fn($q) => $q->whereNull('answer')->orWhere('answer', self::HERE))
             ->where('updated_at', '<', $tickStart)
             ->update(['updated_at' => Carbon::now()]) === 1;
     }
@@ -82,14 +78,20 @@ class Notification extends BaseModel
     }
 
     /**
-     * The volunteer's answer to the pre-shift ping, or the lead's decision on it
+     * What the roll call needs to know about the volunteer on the shift (MOVED, HERE)
+     *
+     * @param bool $told whether they were told about the shift directly, so they get no reminder
      */
-    public static function answer(ShiftEntry $entry, string $answer, ?int $promptMessageId = null): void
+    public static function answer(ShiftEntry $entry, string $answer, bool $told = false): void
     {
-        self::query()->updateOrCreate(
-            ['kind' => self::PRESHIFT, 'shift_id' => $entry->shift_id, 'user_id' => $entry->user_id],
-            ['answer' => $answer, 'prompt_message_id' => $promptMessageId]
+        $notification = self::query()->firstOrNew(
+            ['kind' => self::PRESHIFT, 'shift_id' => $entry->shift_id, 'user_id' => $entry->user_id]
         );
+        $notification->answer = $answer;
+        if ($told) {
+            $notification->sent_at ??= Carbon::now();
+        }
+        $notification->save();
     }
 
     /**

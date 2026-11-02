@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Telegram\Plugin;
 
+use Carbon\Carbon;
 use Engelsystem\Models\Shifts\Shift;
 use Engelsystem\Models\Shifts\ShiftEntry;
 use Engelsystem\Models\User\User;
@@ -18,6 +19,9 @@ class Format
 
     /** Telegram allows 100 buttons per message, up to three per person in a roll call */
     public const MAX_LISTED = 33;
+
+    /** Shifts are shown as starting this much earlier so volunteers arrive on time; the end stays */
+    public const SHOW_EARLIER_MINUTES = 60;
 
     /** @var array<int, string|null> Telegram handles by user id, see loadHandles() */
     protected array $handles = [];
@@ -59,12 +63,21 @@ class Format
 
     public function shiftTime(Shift $shift): string
     {
-        return $shift->start->format('D M j, H:i') . '–' . $shift->end->format('H:i');
+        return $this->start($shift)->format('D M j, H:i') . '–' . $shift->end->format('H:i');
     }
 
     public function shiftLabel(Shift $shift): string
     {
-        return $shift->start->format('D H:i');
+        return $this->start($shift)->format('D H:i');
+    }
+
+    /**
+     * The start the bot shows, SHOW_EARLIER_MINUTES before the real one; timing (reminders,
+     * roll calls, AM/PM) always uses the real start
+     */
+    public function start(Shift $shift): Carbon
+    {
+        return Carbon::instance($shift->start)->subMinutes(self::SHOW_EARLIER_MINUTES);
     }
 
     /**
@@ -129,19 +142,25 @@ class Format
 
     /**
      * Adds lines while the message stays within TEXT_BUDGET (minus $reserve for what follows)
-     * and MAX_LISTED, then a note how many were left out
+     * and $max items, then a note how many were left out
      *
      * @param string[] $lines the message so far, extended in place
      * @param string[] $items one line each
+     * @param int $max MAX_LISTED for lists with buttons per item
      * @return int how many items were added
      */
-    public function addWithin(array &$lines, array $items, string $more, int $reserve = 300): int
-    {
+    public function addWithin(
+        array &$lines,
+        array $items,
+        string $more,
+        int $reserve = 300,
+        int $max = self::MAX_LISTED
+    ): int {
         $used = $this->length(implode("\n", $lines));
         $added = 0;
         foreach ($items as $item) {
             $length = $this->length($item) + 1;
-            if ($added >= self::MAX_LISTED || $used + $length + $reserve > self::TEXT_BUDGET) {
+            if ($added >= $max || $used + $length + $reserve > self::TEXT_BUDGET) {
                 break;
             }
             $lines[] = $item;

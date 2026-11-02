@@ -13,12 +13,15 @@ use Engelsystem\Models\UserAngelType;
 
 /**
  * What leads (supporters of an area) and coordinators do in the bot: team roster, roll call,
- * deciding on cancellations, no-shows, open slots and replacements
+ * no-shows, open slots and replacements
  *
  * Every action checks that the user may lead the area: Telegram clients can send any callback data.
  */
 class Leads
 {
+    /** How many days ahead /roster goes */
+    protected const ROSTER_DAYS = 7;
+
     public function __construct(protected BotApi $api, protected Format $format)
     {
     }
@@ -79,11 +82,10 @@ class Leads
             ->whereIn('user_id', $entries->pluck('user_id'))
             ->pluck('answer', 'user_id');
 
-        // A replacement, or someone who wrote they're late or can't come, isn't here until the lead says
-        // so, even if checked in for the day
+        // Nobody is here until the lead says so; the daily check-in at the desk only says who is in
+        // the building (📍)
         $missing = $entries->filter(fn(ShiftEntry $entry) => !$entry->freeloaded_by
-            && (!in_array($entry->user_id, $checkedIn)
-                || in_array($answers[$entry->user_id] ?? null, [Notification::MOVED, Notification::CANT])));
+            && ($answers[$entry->user_id] ?? null) !== Notification::HERE);
         $noShows = $entries->filter(fn(ShiftEntry $entry) => (bool) $entry->freeloaded_by);
         $staffing = Roster::staffing($shift, $angelTypeId);
 
@@ -114,22 +116,30 @@ class Leads
         $buttons = [];
         if ($missing->isNotEmpty()) {
             $lines[] = '';
-            $lines[] = '<b>Not checked in:</b>';
+            $lines[] = '<b>To confirm:</b>';
             $missing = $missing->values();
-            $note = fn(ShiftEntry $entry) => match ($answers[$entry->user_id] ?? null) {
-                Notification::MOVED => ' — replacement, not seen here yet',
-                Notification::CANT  => ' — wrote: "' . e($this->format->cut(Roster::cancelReason($entry), 80)) . '"',
-                default             => '',
-            };
-            $names = $missing->map(fn(ShiftEntry $entry) => '• ' . $this->format->user($entry->user) . $note($entry));
+            $names = $missing->map(fn(ShiftEntry $entry) => '• ' . $this->format->user($entry->user)
+                . (in_array($entry->user_id, $checkedIn) ? ' 📍' : '')
+                . (($answers[$entry->user_id] ?? null) === Notification::MOVED ? ' — replacement' : ''));
             $listed = $this->format->addWithin($lines, $names->all(), '…and %d more, see the shift in Engelsystem.', 500);
+            if ($missing->take($listed)->contains(fn(ShiftEntry $entry) => in_array($entry->user_id, $checkedIn))) {
+                $lines[] = '📍 = checked in at the desk today';
+            }
+            // Here any time (/rollcall early); a no-show only once the roll call is out, when the team
+            // meets, not while people are still on their way
+            $canNoShow = Scheduler::rollCallStarted($shift);
             foreach ($missing->take($listed) as $entry) {
-                $answer = $answers[$entry->user_id] ?? null;
-                $buttons[] = [
+                $buttons[] = array_filter([
                     ['text' => '✅ ' . $this->format->shortName($entry->user) . ' is here', 'callback_data' => 'here:' . $entry->id],
-                    ...($answer === Notification::CANT ? [['text' => '🙏 Excuse', 'callback_data' => 'rexc:' . $entry->id]] : []),
-                    ['text' => '❌ No-show', 'callback_data' => 'ns:' . $entry->id],
-                ];
+                    $canNoShow ? ['text' => '❌ No-show', 'callback_data' => 'ns:' . $entry->id] : null,
+                ]);
+            }
+            if (!$canNoShow) {
+                $lines[] = '';
+                $lines[] = sprintf(
+                    '⏳ From %s you can also mark no-shows.',
+                    $shift->start->copy()->subMinutes(Scheduler::ROLLCALL_BEFORE_MINUTES)->format('H:i')
+                );
             }
         } elseif ($entries->count() > $noShows->count() && $staffing['filled'] >= $staffing['needed']) {
             // While short, the header ("all here") and the "short" line say it all
@@ -209,22 +219,196 @@ class Leads
             count($today)
         )];
         $lines[] = '';
-        // Big teams: only list who is still missing, the message would get too long otherwise
-        $listed = $members->count() > 30 ? $notOnboarded : $members;
-        if ($listed->isEmpty()) {
+        if ($notOnboarded->isEmpty()) {
             $lines[] = '🎉 Everyone has completed onboarding.';
         }
+        // Everyone, onboarded first; no buttons here, so only the text length limits it
+        $listed = $members->filter(fn(User $member) => $member->state->arrived)->concat($notOnboarded);
         $this->format->addWithin($lines, $listed->map(fn(User $member) => sprintf(
             '%s %s%s%s',
             $member->state->arrived ? '✅' : '⏳',
             $this->format->user($member),
             in_array($member->id, $supporters) ? ' (lead)' : '',
             in_array($member->id, $today) ? ' · 📍 here' : ''
-        ))->values()->all(), '…and %d more, see the dashboard in Engelsystem.');
+        ))->values()->all(), '…and %d more, see the dashboard in Engelsystem.', 300, PHP_INT_MAX);
         $lines[] = '';
         $lines[] = '✅ onboarding complete · ⏳ not yet · 📍 checked in today';
 
         $this->api->send($chatId, implode("\n", $lines));
+    }
+
+    /**
+     * /roster: who is on which shift, for an area and day; coordinators pick any area, leads theirs
+     */
+    public function roster(int|string $chatId, User $user): void
+    {
+        $areas = $this->rosterAreas($user);
+        if (!$areas) {
+            $this->api->send($chatId, 'Only leads and coordinators can see who is on shift.');
+            return;
+        }
+
+        [$text, $buttons] = count($areas) === 1
+            ? $this->rosterMessage($user, $areas[0]->id, 0)
+            : $this->rosterPicker($areas);
+        $this->api->send($chatId, $text, $buttons);
+    }
+
+    /**
+     * The picker again, in the message that showed an area's shifts
+     */
+    public function showRosterPicker(int|string $chatId, int $messageId, User $user): void
+    {
+        $areas = $this->rosterAreas($user);
+        if ($areas) {
+            [$text, $buttons] = $this->rosterPicker($areas);
+            $this->api->edit($chatId, $messageId, $text, $buttons);
+        }
+    }
+
+    /**
+     * An area's shifts on a day, in the message the button was on
+     *
+     * @param int $days from today
+     */
+    public function showRoster(int|string $chatId, int $messageId, User $user, int $angelTypeId, int $days): void
+    {
+        if ($days > self::ROSTER_DAYS || !$this->canLead($user, $angelTypeId)) {
+            return;
+        }
+
+        [$text, $buttons] = $this->rosterMessage($user, $angelTypeId, $days);
+        $this->api->edit($chatId, $messageId, $text, $buttons);
+    }
+
+    /**
+     * @return AngelType[]
+     */
+    protected function rosterAreas(User $user): array
+    {
+        return Roster::isCoordinator($user)
+            ? AngelType::query()->orderBy('name')->get()->all()
+            : collect(Roster::areasLedBy($user))->sortBy('name')->values()->all();
+    }
+
+    /**
+     * @param AngelType[] $areas
+     * @return array{string, array}
+     */
+    protected function rosterPicker(array $areas): array
+    {
+        return ['Who is on shift: which area?', array_map(
+            fn(AngelType $area) => [['text' => $area->name, 'callback_data' => 'ros:' . $area->id . ':0']],
+            $areas
+        )];
+    }
+
+    /**
+     * @return array{string, array}
+     */
+    protected function rosterMessage(User $user, int $angelTypeId, int $days): array
+    {
+        $area = AngelType::query()->find($angelTypeId);
+        $day = Carbon::today()->addDays($days);
+        $shifts = Shift::query()
+            ->with(['schedule', 'neededAngelTypes', 'shiftEntries.user.personalData', 'shiftEntries.user.state'])
+            ->whereBetween('start', [$day->copy()->startOfDay(), $day->copy()->endOfDay()])
+            ->orderBy('start')
+            ->get()
+            ->filter(fn(Shift $shift) => Roster::needed($shift)->contains('angel_type_id', $angelTypeId)
+                || $shift->shiftEntries->contains('angel_type_id', $angelTypeId))
+            ->values();
+
+        $entries = $shifts->flatMap(fn(Shift $shift) => $shift->shiftEntries->where('angel_type_id', $angelTypeId));
+        $this->format->loadHandles($entries->pluck('user_id'));
+        $leadIds = UserAngelType::query()
+            ->where('angel_type_id', $angelTypeId)
+            ->where('supporter', true)
+            ->pluck('user_id')
+            ->all();
+        // Check-ins are per day, so they only say something about today
+        $checkedIn = $days === 0 ? Checkin::usersOn($day, $entries->pluck('user_id')) : [];
+
+        $lines = [sprintf('👥 <b>%s</b> · %s', e($area?->name), $day->format('D M j'))];
+        if ($shifts->isEmpty()) {
+            $lines[] = '';
+            $lines[] = 'No shifts on this day.';
+        }
+        foreach ($shifts as $i => $shift) {
+            // Room for the shift's header and the legend; the rest of the day is in Engelsystem
+            if ($this->format->length(implode("\n", $lines)) + 300 > Format::TEXT_BUDGET) {
+                $lines[] = '';
+                $lines[] = sprintf('…and %d more shift(s), see Engelsystem.', $shifts->count() - $i);
+                break;
+            }
+            $onShift = $shift->shiftEntries->where('angel_type_id', $angelTypeId);
+            $noShows = $onShift->filter(fn(ShiftEntry $entry) => (bool) $entry->freeloaded_by);
+            $staffing = Roster::staffing($shift, $angelTypeId);
+            $lines[] = '';
+            $lines[] = sprintf(
+                '<b>%s</b> %s–%s · %d/%d%s',
+                e($shift->title),
+                $this->format->start($shift)->format('H:i'),
+                $shift->end->format('H:i'),
+                $staffing['filled'],
+                $staffing['needed'],
+                $staffing['filled'] < $staffing['needed']
+                    ? sprintf(' · %d open', $staffing['needed'] - $staffing['filled'])
+                    : ''
+            );
+            // Leads first, then by name
+            $people = $onShift->reject(fn(ShiftEntry $entry) => (bool) $entry->freeloaded_by)
+                ->sortBy(fn(ShiftEntry $entry) => [
+                    in_array($entry->user_id, $leadIds) ? 0 : 1,
+                    mb_strtolower($this->format->plainName($entry->user)),
+                ])
+                ->map(fn(ShiftEntry $entry) => sprintf(
+                    '%s %s%s%s',
+                    in_array($entry->user_id, $leadIds) ? '👤' : '•',
+                    $this->format->user($entry->user),
+                    // Onboarding marks them arrived in Engelsystem
+                    $entry->user->state->arrived ? '' : ' (not onboarded)',
+                    in_array($entry->user_id, $checkedIn) ? ' 📍' : ''
+                ));
+            if ($people->isEmpty()) {
+                $lines[] = 'Nobody yet.';
+            }
+            $more = '…and %d more, see the shift in Engelsystem.';
+            $this->format->addWithin($lines, $people->values()->all(), $more, 300, PHP_INT_MAX);
+            if ($noShows->isNotEmpty()) {
+                $names = $noShows->map(fn(ShiftEntry $entry) => $this->format->user($entry->user))->values();
+                // As many as fit, like the people above
+                $room = Format::TEXT_BUDGET - 300 - $this->format->length(implode("\n", $lines));
+                $listed = 0;
+                while (
+                    $listed < $names->count()
+                    && $this->format->length($names->take($listed + 1)->implode(', ')) <= $room
+                ) {
+                    $listed++;
+                }
+                $left = $names->count() - $listed;
+                $lines[] = '❌ No-show: ' . $names->take($listed)->implode(', ')
+                    . ($left ? sprintf('%s%d more', $listed ? ' and ' : '', $left) : '');
+            }
+        }
+        if ($shifts->isNotEmpty()) {
+            $lines[] = '';
+            $lines[] = '👤 lead' . ($days === 0 ? ' · 📍 checked in today' : '');
+        }
+
+        $toDay = fn(string $text, int $to) => [
+            'text'          => $text,
+            'callback_data' => sprintf('ros:%d:%d', $angelTypeId, $to),
+        ];
+        $buttons = [[
+            ...($days > 0 ? [$toDay('← ' . $day->copy()->subDay()->format('D'), $days - 1)] : []),
+            ...($days < self::ROSTER_DAYS ? [$toDay($day->copy()->addDay()->format('D') . ' →', $days + 1)] : []),
+        ]];
+        if (count($this->rosterAreas($user)) > 1) {
+            $buttons[] = [['text' => '☰ Other area', 'callback_data' => 'rosa:0']];
+        }
+
+        return [implode("\n", $lines), $buttons];
     }
 
     public function gaps(int|string $chatId, User $user): void
@@ -266,99 +450,50 @@ class Leads
         $this->api->send($chatId, implode("\n", $lines), array_slice($buttons, 0, 20));
     }
 
-    /**
-     * The lead's decision on a cancellation, recorded the way Engelsystem does it: excused means
-     * off the shift, not excused means marked as a no-show (freeloaded)
-     */
-    public function decide(
-        int|string $chatId,
-        ?int $messageId,
-        User $lead,
-        int $entryId,
-        bool $excused,
-        bool $rollCall = false
-    ): void {
-        /** @var ShiftEntry|null $entry */
-        $entry = ShiftEntry::query()->with(['shift', 'user'])->find($entryId);
-        // An entry that's gone (excused) can't tell whose area it was: nothing to do
-        if (!$entry || !$this->canLead($lead, $entry->angel_type_id) || $this->isOwn($lead, $entry)) {
-            return;
-        }
-
-        // The buttons only come with a cancellation, and only until it's decided
-        $pending = Notification::query()
-            ->where('kind', Notification::PRESHIFT)
-            ->where('shift_id', $entry->shift_id)
-            ->where('user_id', $entry->user_id)
-            ->value('answer') === Notification::CANT;
-        if ($entry->freeloaded_by || !$pending) {
-            $this->api->edit($chatId, $messageId, 'Already decided.');
-            return;
-        }
-
-        $shift = $entry->shift;
-        $volunteer = $entry->user;
-        $reason = Roster::cancelReason($entry);
-        $what = e($shift->title) . ' · ' . $this->format->shiftTime($shift);
-
-        if ($excused) {
-            // The reason stays out of the log, it may be about someone's health
-            Roster::unassign($entry, 'excused by ' . $lead->name);
-            Notification::answer($entry, Notification::EXCUSED);
-            $done = sprintf('✅ %s excused %s, they are off %s.', $this->format->user($lead), $this->format->user($volunteer), $what);
-            $toVolunteer = sprintf('✅ You were excused from %s. You are off the shift.', $what);
-        } else {
-            Roster::markNoShow($entry, $lead, 'Not excused' . ($reason ? ': ' . $reason : ''));
-            Notification::answer($entry, Notification::UNEXCUSED);
-            $done = sprintf('❌ %s marked %s as no-show for %s.', $this->format->user($lead), $this->format->user($volunteer), $what);
-            $toVolunteer = sprintf('❌ Your lead did not excuse you from %s. You are marked as a no-show for this shift.', $what);
-        }
-
-        if ($rollCall) {
-            [$text, $buttons] = $this->rollCallMessage($shift, $entry->angel_type_id);
-            $this->api->edit($chatId, $messageId, $text, $buttons);
-        } else {
-            // The gap alert skips this chat, so the button to fill it comes here
-            $this->api->edit($chatId, $messageId, $done, $this->replacementButton($shift, $entry->angel_type_id));
-        }
-
-        if ($target = TelegramAccount::chatOf($volunteer)) {
-            $this->api->send($target, $toVolunteer);
-        }
-        $this->alertGap($shift, $entry->angel_type_id, $done, exceptChatId: $chatId);
-    }
-
     public function markHere(int|string $chatId, ?int $messageId, User $lead, int $entryId): void
     {
         $entry = ShiftEntry::query()->with('shift')->find($entryId);
-        if (!$entry || !$this->canRollCall($lead, $entry)) {
+        if (!$entry) {
+            $this->entryGone($chatId);
+            return;
+        }
+        if (!$this->canRollCall($lead, $entry)) {
             return;
         }
 
-        Checkin::record($entry->user_id, $entry->shift->start);
-        $answer = Notification::query()
-            ->where('kind', Notification::PRESHIFT)
-            ->where('shift_id', $entry->shift_id)
-            ->where('user_id', $entry->user_id)
-            ->value('answer');
-        if (in_array($answer, [Notification::MOVED, Notification::CANT])) {
-            Notification::answer($entry, Notification::HERE);
-        }
+        // Only the roll call remembers it; Engelsystem records no-shows, not who was there
+        Notification::answer($entry, Notification::HERE);
 
         [$text, $buttons] = $this->rollCallMessage($entry->shift, $entry->angel_type_id);
         $this->api->edit($chatId, $messageId, $text, $buttons);
     }
 
+    /**
+     * A roll call button for someone no longer on the shift: moved by coordination (Swap people), as
+     * a replacement, or removed in Engelsystem; the entry is gone, and with it which shift it was
+     */
+    protected function entryGone(int|string $chatId): void
+    {
+        $this->api->send(
+            $chatId,
+            'That person isn\'t on this shift any more, they were moved or removed. /rollcall shows who is on it now.'
+        );
+    }
+
     public function markNoShow(int|string $chatId, ?int $messageId, User $lead, int $entryId): void
     {
         $entry = ShiftEntry::query()->with(['shift', 'user'])->find($entryId);
-        if (!$entry || !$this->canRollCall($lead, $entry)) {
+        if (!$entry) {
+            $this->entryGone($chatId);
+            return;
+        }
+        // A no-show only once the roll call is out, see rollCallMessage()
+        if (!$this->canRollCall($lead, $entry) || !Scheduler::rollCallStarted($entry->shift)) {
             return;
         }
 
         if (!$entry->freeloaded_by) {
-            $reason = Roster::cancelReason($entry);
-            Roster::markNoShow($entry, $lead, $reason ? 'Not excused: ' . $reason : null);
+            Roster::markNoShow($entry, $lead);
             $this->alertGap(
                 $entry->shift,
                 $entry->angel_type_id,
@@ -479,6 +614,29 @@ class Leads
         $this->api->edit($chatId, $messageId, ($note !== '' ? $note . "\n\n" : '') . $text, $buttons);
     }
 
+    /**
+     * /rollcall: the roll call of every shift the lead leads whose roll call is out, else of their
+     * next one; for a lead put on the shift after the roll call went out, or who lost the message.
+     * Coordinators lead every shift they are on.
+     */
+    public function rollCall(int|string $chatId, User $user): void
+    {
+        $led = Roster::upcoming($user)
+            ->filter(fn(ShiftEntry $entry) => !$entry->freeloaded_by && $this->canLead($user, $entry->angel_type_id))
+            ->values();
+        if ($led->isEmpty()) {
+            $this->api->send($chatId, 'You are not leading any upcoming shift. /shifts lists your shifts.');
+            return;
+        }
+
+        // At the handover, the shift ending and the one about to start
+        $out = $led->filter(fn(ShiftEntry $entry) => Scheduler::rollCallStarted($entry->shift));
+        foreach ($out->isNotEmpty() ? $out : $led->take(1) as $entry) {
+            [$text, $buttons] = $this->rollCallMessage($entry->shift, $entry->angel_type_id);
+            $this->api->send($chatId, $text, $buttons);
+        }
+    }
+
     public function assignReplacement(
         int|string $chatId,
         ?int $messageId,
@@ -510,10 +668,10 @@ class Leads
             return;
         }
         $staffing = Roster::staffing($shift, $angelTypeId);
-        // Checked in for the day, but not seen at this shift yet: the roll call asks the lead. For a
-        // later shift they get the usual reminder instead (MOVED counts as answered)
+        // The roll call shows them as a replacement, and they get no reminder as they are told below.
+        // For a later shift they get the usual reminder instead
         if ($shift->start <= Carbon::now()->addMinutes(Scheduler::PRESHIFT_MINUTES)) {
-            Notification::answer($entry, Notification::MOVED);
+            Notification::answer($entry, Notification::MOVED, told: true);
         }
 
         $target = TelegramAccount::chatOf($user);
@@ -623,8 +781,13 @@ class Leads
     protected function alertGap(Shift $shift, int $angelTypeId, string $reason, int|string|null $exceptChatId = null): void
     {
         $staffing = Roster::staffing($shift, $angelTypeId);
-        // Standby isn't refilled, it shrinks as people step in elsewhere
-        if ($staffing['filled'] >= $staffing['needed'] || $angelTypeId === Roster::standbyArea()?->id) {
+        // Standby isn't refilled, it shrinks as people step in elsewhere; a shift that is over isn't
+        // refilled either (an old roll call button)
+        if (
+            $staffing['filled'] >= $staffing['needed']
+            || $angelTypeId === Roster::standbyArea()?->id
+            || $shift->end <= Carbon::now()
+        ) {
             return;
         }
 
@@ -655,43 +818,13 @@ class Leads
     }
 
     /**
-     * Sends to the shift's leads directly, or to coordination if none of them can be reached
-     *
-     * @return bool whether a lead got it
-     */
-    public function sendToLeads(Shift $shift, int $angelTypeId, string $text, array $buttons = [], ?User $except = null): bool
-    {
-        $reached = false;
-        foreach (Roster::leadsOf($shift, $angelTypeId) as $lead) {
-            if ($lead->id !== $except?->id && ($chatId = TelegramAccount::chatOf($lead))) {
-                $reached = $this->api->send($chatId, $text, $buttons) !== null || $reached;
-            }
-        }
-
-        if (!$reached) {
-            foreach (Chat::forArea(null) as $chat) {
-                $this->api->send($chat->chat_id, $this->toCoordinationNote($shift, $angelTypeId, $except) . "\n\n" . $text, $buttons);
-            }
-        }
-
-        return $reached;
-    }
-
-    /**
      * Why something for the shift's lead went to coordination instead
      */
-    protected function toCoordinationNote(Shift $shift, int $angelTypeId, ?User $except = null): string
+    protected function toCoordinationNote(Shift $shift, int $angelTypeId): string
     {
-        $leads = Roster::leadsOf($shift, $angelTypeId);
-
-        return match (true) {
-            $leads->isEmpty()
-                => '⚠️ This shift has no lead, so this goes to coordination.',
-            $except && $leads->every(fn(User $lead) => $lead->id === $except->id)
-                => sprintf('⚠️ %s is the lead of this shift, so this goes to coordination.', $this->format->user($except)),
-            default
-                => '⚠️ The lead of this shift couldn\'t be reached on Telegram, so this goes to coordination.',
-        };
+        return Roster::leadsOf($shift, $angelTypeId)->isEmpty()
+            ? '⚠️ This shift has no lead, so this goes to coordination.'
+            : '⚠️ The lead of this shift couldn\'t be reached on Telegram, so this goes to coordination.';
     }
 
     protected function canLead(User $user, int $angelTypeId): bool
@@ -700,7 +833,7 @@ class Leads
     }
 
     /**
-     * A lead's own entry is for coordination to decide on (leads aren't on their own roll call)
+     * A lead's own entry is for coordination to mark (leads aren't on their own roll call)
      */
     protected function isOwn(User $lead, ShiftEntry $entry): bool
     {
@@ -708,25 +841,10 @@ class Leads
     }
 
     /**
-     * Roll call buttons only work once the roll call is out
+     * Roll call buttons work any time, also from /rollcall before the roll call is out
      */
     protected function canRollCall(User $lead, ShiftEntry $entry): bool
     {
-        return $this->canLead($lead, $entry->angel_type_id)
-            && !$this->isOwn($lead, $entry)
-            && Scheduler::rollCallStarted($entry->shift);
-    }
-
-    /**
-     * @return array the Find replacement button if the area is short on the shift (never for standby)
-     */
-    protected function replacementButton(Shift $shift, int $angelTypeId): array
-    {
-        $staffing = Roster::staffing($shift, $angelTypeId);
-        if ($staffing['filled'] >= $staffing['needed'] || $angelTypeId === Roster::standbyArea()?->id) {
-            return [];
-        }
-
-        return [[['text' => '🔁 Find replacement', 'callback_data' => 'rep:' . $shift->id . ':' . $angelTypeId]]];
+        return $this->canLead($lead, $entry->angel_type_id) && !$this->isOwn($lead, $entry);
     }
 }

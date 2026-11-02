@@ -12,6 +12,68 @@
             </span>
         </div>
 
+        {# Shifts: open slots and check-ins #}
+        <h2 class="h4">Shifts today and tomorrow</h2>
+        <p>
+            <b>{{ shifts|reduce((sum, row) => sum + row.open, 0) }}</b> open slots ·
+            <b>{{ checkins.checked_in }}</b> of {{ checkins.people }} with a shift today checked in{% if checkins.without_shift %} ·
+            {{ checkins.without_shift }} checked in without a shift today{% endif %}
+            <br><span class="small text-muted">
+                Only shifts with open slots or people not checked in ·
+                <span class="text-danger">red</span>: started, <span class="text-warning">yellow</span>: starts within 3 hours ·
+                standby isn't counted as open
+            </span>
+        </p>
+        {% if shifts is empty %}
+            <p class="text-success mb-5">No open slots, and everyone on today's shifts checked in.</p>
+        {% else %}
+            <div class="table-responsive mb-2">
+                <table class="table table-sm align-middle">
+                    <thead>
+                        <tr><th>Shift</th><th>Area</th><th class="text-end">Filled</th><th class="text-end">Open</th><th class="text-end">Checked in</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for row in shifts %}
+                            {% set bar = row.urgency ? 'box-shadow: inset 4px 0 var(--bs-' ~ row.urgency ~ ')' %}
+                            {% set cell = row.missing is empty ? '' : 'border-bottom-0' %}
+                            <tr>
+                                <td class="{{ cell }}"{% if bar %} style="{{ bar }}"{% endif %}>
+                                    <a href="{{ url('/shifts', {'action': 'view', 'shift_id': row.shift.id}) }}">
+                                        {{ row.shift.start.format('D H:i') }}–{{ row.shift.end.format('H:i') }}
+                                    </a>
+                                    <span class="small text-muted">{{ row.shift.title }}</span>
+                                </td>
+                                <td class="{{ cell }}">{{ row.angel_type.name }}</td>
+                                <td class="text-end {{ cell }}">{{ row.filled }}{% if row.needed %}/{{ row.needed }}{% endif %}</td>
+                                <td class="text-end fw-bold {{ cell }} {{ row.open and row.urgency ? 'text-' ~ row.urgency }}">{{ row.open ?: '' }}</td>
+                                <td class="text-end {{ cell }} {{ row.missing is empty ? '' : 'text-danger fw-bold' }}">
+                                    {{ row.today ? row.checked_in ~ '/' ~ row.filled : '' }}
+                                </td>
+                            </tr>
+                            {% if row.missing is not empty %}
+                                <tr>
+                                    <td colspan="5" class="small pt-0"{% if bar %} style="{{ bar }}"{% endif %}>
+                                        <span class="text-muted">Not checked in:</span>
+                                        {% for person in row.missing %}
+                                            <a href="{{ url('/users', {'action': 'view', 'user_id': person.user.id}) }}">{{ person.user.displayName }}</a>
+                                            {%- if person.handle %} <span class="text-muted">@{{ person.handle }}</span>{% endif %}
+                                            {%- if person.lead %} <span class="badge bg-info">lead</span>{% endif %}
+                                            {%- if person.here %} <span class="text-success">(here per roll call)</span>{% endif %}
+                                            {{- not loop.last ? ',' }}
+                                        {% endfor %}
+                                    </td>
+                                </tr>
+                            {% endif %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <p class="small text-muted mb-5">
+                Checked in means they scanned today's QR code at the check-in desk; the lead's roll call
+                says who is actually at the shift. No-shows aren't listed.
+            </p>
+        {% endif %}
+
         {# Onboarding #}
         {% set total = onboarding.total %}
         <h2 class="h4">Onboarding</h2>
@@ -67,7 +129,7 @@
 
         <h2 class="h4">Everything else is in Engelsystem</h2>
         <ul class="mb-5">
-            <li><a href="{{ url('/user-shifts') }}">Shifts</a>: staffing and open slots</li>
+            <li><a href="{{ url('/user-shifts') }}">Shifts</a>: staffing, and open slots after tomorrow</li>
             <li><a href="{{ url('/admin-free') }}">Free angels</a>: who is available for a replacement</li>
             <li><a href="{{ url('/admin-active') }}">Goodie list</a>: goodie score (no-shows count against it)</li>
             <li><a href="{{ url('/admin-arrive') }}">Arrived angels</a>: onboarding by hand</li>
