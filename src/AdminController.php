@@ -40,6 +40,7 @@ class AdminController extends BaseController
         protected Authenticator $auth,
         protected UrlGenerator $url,
         protected Swap $swap,
+        protected StandbyBoard $standby,
         protected LoggerInterface $log
     ) {
     }
@@ -175,11 +176,11 @@ class AdminController extends BaseController
     }
 
     /**
-     * Open slots today and tomorrow, and onboarding progress
+     * Open slots today and tomorrow, a day's check-ins and onboarding progress
      */
-    public function dashboard(): Response
+    public function dashboard(Request $request): Response
     {
-        return $this->response->withView('telegram/dashboard', Dashboard::data());
+        return $this->response->withView('telegram/dashboard', Dashboard::data($this->query($request, 'day')));
     }
 
     /**
@@ -191,15 +192,145 @@ class AdminController extends BaseController
     }
 
     /**
+     * A day's shifts at a glance, a page of its own for a screen, see Overview
+     */
+    public function overview(Request $request): Response
+    {
+        return $this->response->withView('telegram/overview', Overview::data($this->query($request, 'day')));
+    }
+
+    /**
+     * The overview's updates; a file of its own, as the site's CSP blocks inline scripts
+     */
+    public function overviewScript(): Response
+    {
+        return $this->script('overview.js');
+    }
+
+    /**
+     * The live dashboard for the desk: a day's numbers and shifts, updated in place, see LiveDashboard
+     */
+    public function live(Request $request): Response
+    {
+        return $this->response->withView('telegram/live', LiveDashboard::data($this->query($request, 'day')));
+    }
+
+    /**
+     * The live dashboard's updates, pop-ups and confetti; a file of its own, as the site's CSP blocks inline scripts
+     */
+    public function liveScript(): Response
+    {
+        return $this->script('live.js');
+    }
+
+    /**
+     * The day's check-ins per volunteer, and check-ins by hand, see CheckinList
+     */
+    public function checkins(Request $request): Response
+    {
+        $user = $this->query($request, 'user');
+
+        return $this->response->withView('telegram/checkins', [
+            ...CheckinList::data(
+                $this->query($request, 'day'),
+                $this->query($request, 'search'),
+                is_numeric($user) ? (int) $user : null
+            ),
+            'open' => $this->fragment($this->query($request, 'open')),
+        ]);
+    }
+
+    /**
+     * Needed, assigned and no-shows per shift of a day, see Attendance
+     */
+    public function attendance(Request $request): Response
+    {
+        return $this->response->withView('telegram/attendance', Attendance::data($this->query($request, 'day')));
+    }
+
+    /**
+     * Picking another day reloads the page (check-in and attendance); a file of its own, as the site's CSP blocks inline scripts
+     */
+    public function checkinsScript(): Response
+    {
+        return $this->script('checkins.js');
+    }
+
+    /**
+     * Checks someone in for a day with shifts, or takes their check-in back
+     */
+    public function checkinsSet(Request $request): Response
+    {
+        $user = User::query()->find((int) $this->posted($request, 'user'));
+        $day = $this->posted($request, 'day');
+        // Back to where it was clicked: the shift or list (kept open), or the search
+        $open = $this->fragment($this->posted($request, 'open'));
+        $back = $this->url->to('/admin/telegram/checkins', array_filter([
+            'day'    => $open !== '' ? $day : $request->postData('view_day'),
+            'open'   => $open,
+            'search' => $open !== '' ? null : $request->postData('search'),
+            'user'   => $open !== '' || $request->postData('search') ? null : $request->postData('user'),
+        ])) . ($open !== '' ? '#open-' . $open : '#find');
+        if (!$user || !Checkin::days()->has($day)) {
+            $this->addNotification('Unknown person or a day without shifts.', NotificationType::ERROR);
+            return $this->redirect->to($back);
+        }
+
+        $date = Carbon::parse($day);
+        $label = $date->format('D M j');
+        $by = $this->auth->user()->name;
+        if ($request->postData('checked_in')) {
+            if (Checkin::record($user->id, $date, byHand: true)) {
+                Roster::log(sprintf('%s checked in %s for %s', $by, $user->name, $label));
+            }
+            $this->addNotification(sprintf('%s is checked in for %s.', $user->displayName, $label));
+        } else {
+            if (Checkin::remove($user->id, $date)) {
+                Roster::log(sprintf('%s took back the check-in of %s for %s', $by, $user->name, $label));
+            }
+            $this->addNotification(sprintf('%s is no longer checked in for %s.', $user->displayName, $label));
+        }
+
+        return $this->redirect->to($back);
+    }
+
+    /**
+     * Checks in every lead (supporter of any area) for every day with shifts
+     */
+    public function checkinsLeads(): Response
+    {
+        $leads = Roster::leadIds();
+        $days = Checkin::days();
+        $new = Checkin::recordAll($leads, $days->keys());
+        if ($new) {
+            Roster::log(sprintf(
+                '%s checked in all %d leads for every day with shifts (%d new check-ins)',
+                $this->auth->user()->name,
+                $leads->count(),
+                $new
+            ));
+        }
+
+        $this->addNotification(sprintf(
+            'All %d leads are checked in for %d days, %d check-ins were new.',
+            $leads->count(),
+            $days->count(),
+            $new
+        ));
+
+        return $this->redirect->to('/admin/telegram/checkins');
+    }
+
+    /**
      * Swapping people between two shifts of the same half day, see Swap
      */
     public function swap(Request $request): Response
     {
         return $this->response->withView('telegram/swap', Swap::data(
-            $request->get('day'),
-            $request->get('half'),
-            $request->get('left'),
-            $request->get('right')
+            $this->query($request, 'day'),
+            $this->query($request, 'half'),
+            $this->query($request, 'left'),
+            $this->query($request, 'right')
         ));
     }
 
@@ -217,8 +348,8 @@ class AdminController extends BaseController
             $result = $this->swap->run(
                 $left,
                 $right,
-                $request->request->all('from_left'),
-                $request->request->all('from_right'),
+                $this->postedArray($request, 'from_left'),
+                $this->postedArray($request, 'from_right'),
                 $by
             );
             AfterResponse::run($this->log, 'Swap messages', fn() => $this->swap->tell($result, $by));
@@ -244,6 +375,121 @@ class AdminController extends BaseController
             'left'  => $left,
             'right' => $right,
         ]));
+    }
+
+    /**
+     * Moving anyone between an area's shift and the standby of the same half day, see StandbyBoard
+     */
+    public function standby(Request $request): Response
+    {
+        return $this->response->withView('telegram/standby', StandbyBoard::data(
+            $this->query($request, 'day'),
+            $this->query($request, 'half')
+        ));
+    }
+
+    public function standbyScript(): Response
+    {
+        return $this->script('standby.js');
+    }
+
+    public function standbyMove(Request $request): Response
+    {
+        $entry = $this->posted($request, 'entry');
+        $to = $this->postedArray($request, 'to')[$entry] ?? null;
+        try {
+            $by = $this->auth->user();
+            $result = $this->standby->move($entry, $to, $by);
+            AfterResponse::run($this->log, 'Standby move messages', fn() => $this->swap->tell($result, $by));
+
+            $this->addNotification(sprintf(
+                'Moved %s. The bot tells them, the leads of both shifts and coordination.',
+                Swap::summary($result)
+            ));
+            if ($unreachable = Swap::unreachable($result)) {
+                $this->addNotification(
+                    'Not on Telegram, please tell them directly: '
+                    . implode(', ', array_map(fn(User $user) => $user->displayName, $unreachable)),
+                    NotificationType::WARNING
+                );
+            }
+        } catch (InvalidArgumentException $e) {
+            $this->addNotification($e->getMessage(), NotificationType::ERROR);
+        }
+
+        return $this->redirect->to($this->url->to('/admin/telegram/standby', [
+            'day'  => $request->postData('day'),
+            'half' => $request->postData('half'),
+        ]));
+    }
+
+    /**
+     * Every shift's need in one table, see Needs
+     */
+    public function needs(): Response
+    {
+        return $this->response->withView('telegram/needs', Needs::data());
+    }
+
+    public function needsScript(): Response
+    {
+        return $this->script('needs.js');
+    }
+
+    public function needsSave(Request $request): Response
+    {
+        try {
+            $changed = Needs::save(
+                $this->postedArray($request, 'need'),
+                $this->postedArray($request, 'was'),
+                $this->auth->user()
+            );
+            $this->addNotification($changed
+                ? sprintf('%d need(s) changed: %s.', count($changed), implode('; ', $changed))
+                : 'Nothing changed.');
+        } catch (InvalidArgumentException $e) {
+            $this->addNotification($e->getMessage(), NotificationType::ERROR);
+        }
+
+        return $this->redirect->to('/admin/telegram/needs');
+    }
+
+    /**
+     * A query parameter as text, null when missing or not text (?day[]=x)
+     */
+    protected function query(Request $request, string $key): ?string
+    {
+        $value = $request->get($key);
+
+        return is_scalar($value) ? (string) $value : null;
+    }
+
+    /**
+     * A form field as text, empty when missing or not text
+     */
+    protected function posted(Request $request, string $key): string
+    {
+        $value = $request->postData($key);
+
+        return is_scalar($value) ? (string) $value : '';
+    }
+
+    /**
+     * A form field holding a list (name[...]), empty when missing or not a list
+     */
+    protected function postedArray(Request $request, string $key): array
+    {
+        $value = $request->request->all()[$key] ?? [];
+
+        return is_array($value) ? $value : [];
+    }
+
+    /**
+     * Which list or shift to open again: an anchor name, nothing else
+     */
+    protected function fragment(?string $open): string
+    {
+        return preg_match('/^[a-z0-9-]{1,40}$/', (string) $open) ? (string) $open : '';
     }
 
     protected function script(string $file): Response

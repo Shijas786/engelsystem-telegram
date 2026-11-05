@@ -9,7 +9,6 @@ use Engelsystem\Models\AngelType;
 use Engelsystem\Models\Shifts\Shift;
 use Engelsystem\Models\Shifts\ShiftEntry;
 use Engelsystem\Models\User\User;
-use Engelsystem\Models\UserAngelType;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
@@ -40,18 +39,7 @@ class Swap
      */
     public static function data(?string $day, ?string $half, ?string $left, ?string $right): array
     {
-        $now = Carbon::now();
-        $days = Shift::query()
-            ->where('end', '>', $now)
-            ->selectRaw('DATE(start) AS day')
-            ->distinct()
-            ->orderBy('day')
-            ->pluck('day')
-            ->mapWithKeys(fn(string $value) => [$value => Carbon::parse($value)->format('D M j')]);
-        if (!$days->has($day)) {
-            $day = $days->has($now->toDateString()) ? $now->toDateString() : $days->keys()->first();
-        }
-        $half = in_array($half, ['AM', 'PM']) ? $half : ($now->hour < 12 ? 'AM' : 'PM');
+        ['days' => $days, 'day' => $day, 'half' => $half] = self::halfDay($day, $half);
 
         $sides = $day ? self::sides(Carbon::parse($day), $half) : new Collection();
         $standby = Roster::standbyArea()?->id;
@@ -62,7 +50,7 @@ class Swap
             ?? $sides->first(fn(array $side) => $side['key'] !== $left)['key'] ?? null;
 
         return [
-            'days'      => $days->all(),
+            'days'      => $days,
             'day'       => $day,
             'half'      => $half,
             'sides'     => $sides->mapWithKeys(fn(array $side) => [$side['key'] => $side['label']])->all(),
@@ -328,11 +316,35 @@ class Swap
     }
 
     /**
+     * The days with shifts to come, and the picked day and half day: today and now's half by
+     * default, or the first day to come
+     *
+     * @return array{days: array<string, string>, day: ?string, half: string}
+     */
+    public static function halfDay(?string $day, ?string $half): array
+    {
+        $now = Carbon::now();
+        $days = Shift::query()
+            ->where('end', '>', $now)
+            ->selectRaw('DATE(start) AS day')
+            ->distinct()
+            ->orderBy('day')
+            ->pluck('day')
+            ->mapWithKeys(fn(string $value) => [$value => Carbon::parse($value)->format('D M j')]);
+        if (!$days->has($day)) {
+            $day = $days->has($now->toDateString()) ? $now->toDateString() : $days->keys()->first();
+        }
+        $half = in_array($half, ['AM', 'PM']) ? $half : ($now->hour < 12 ? 'AM' : 'PM');
+
+        return ['days' => $days->all(), 'day' => $day, 'half' => $half];
+    }
+
+    /**
      * Every shift and area of the half day, by area
      *
      * @return Collection<string, array{key: string, label: string, shift: Shift, area: AngelType}>
      */
-    protected static function sides(Carbon $day, string $half): Collection
+    public static function sides(Carbon $day, string $half): Collection
     {
         $areas = AngelType::query()->get()->keyBy('id');
 
@@ -373,7 +385,7 @@ class Swap
     /**
      * @return array{Shift, AngelType}
      */
-    protected static function side(string $key): array
+    public static function side(string $key): array
     {
         [$shiftId, $areaId] = array_map('intval', explode('-', $key . '-'));
         $shift = Shift::query()->find($shiftId);
@@ -392,7 +404,7 @@ class Swap
     /**
      * The side's people: leads first, then by name, no-shows last (they stay where they are)
      */
-    protected static function people(array $side, bool $today): array
+    public static function people(array $side, bool $today): array
     {
         /** @var Shift $shift */
         $shift = $side['shift'];
@@ -401,11 +413,7 @@ class Swap
             ->where('angel_type_id', $side['area']->id)
             ->get();
         $accounts = TelegramAccount::query()->whereIn('user_id', $entries->pluck('user_id'))->get()->keyBy('user_id');
-        $leadIds = UserAngelType::query()
-            ->where('angel_type_id', $side['area']->id)
-            ->where('supporter', true)
-            ->pluck('user_id')
-            ->all();
+        $leadIds = Roster::leadIds()->all();
         $checkedIn = $today ? Checkin::usersOn($shift->start, $entries->pluck('user_id')) : [];
         $staffing = Roster::staffing($shift, $side['area']->id);
 
@@ -415,6 +423,10 @@ class Swap
             'over'   => $shift->end <= Carbon::now(),
             'filled' => $staffing['filled'],
             'needed' => $staffing['needed'],
+            // For the page to work out the numbers after a move: leads count neither as needed nor
+            // as filled, see Roster::volunteers()
+            'total'  => (int) Roster::needed($shift)->where('angel_type_id', $side['area']->id)->sum('count'),
+            'leads'  => $entries->whereIn('user_id', $leadIds)->count(),
             'people' => $entries
                 ->map(fn(ShiftEntry $entry) => [
                     'id'         => $entry->id,
@@ -441,6 +453,7 @@ class Swap
         /** @var Shift $shift */
         $shift = $side['shift'];
         $users = self::freeDuring($shift)->with(['personalData', 'state'])->get();
+        $leadIds = Roster::leadIds()->all();
         $accounts = TelegramAccount::query()->whereIn('user_id', $users->pluck('id'))->get()->keyBy('user_id');
         $checkedIn = $today ? Checkin::usersOn($shift->start, $users->pluck('id')) : [];
 
@@ -448,15 +461,17 @@ class Swap
             'name'   => self::FREE_NAME,
             'time'   => 'not on a shift ' . $shift->start->format('H:i') . '–' . $shift->end->format('H:i'),
             'over'   => false,
-            'filled' => $users->count(),
+            'filled' => $users->whereNotIn('id', $leadIds)->count(),
             'needed' => null,
+            'total'  => null,
+            'leads'  => 0,
             'people' => $users
                 ->map(fn(User $user) => [
                     'id'         => $user->id,
                     'name'       => $user->displayName,
                     'handle'     => $accounts->get($user->id)?->username,
                     'telegram'   => (bool) $accounts->get($user->id)?->chat_id,
-                    'lead'       => false,
+                    'lead'       => in_array($user->id, $leadIds),
                     'onboarded'  => $user->state->arrived,
                     'checked_in' => in_array($user->id, $checkedIn),
                     'no_show'    => false,
